@@ -1,1 +1,138 @@
+name: DigitalPlat Auto Renew
 
+on:
+  schedule:
+    # 每月 1 日 UTC 01:30（北京时间 09:30）运行一次；免费续期窗口 120 天，每月检查足够，
+    # 且月度提交间隔约 31 天，仍可防"60 天无活动自动停用"
+    - cron: "30 1 1 * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "仅检查不续期（dry run）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: digitalplat-auto-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    env:
+      HYSTERIA2_URI: ${{ secrets.HYSTERIA2_URI }}
+      # 自备代理时在 Variables 里配置（若 hysteria2 步骤启动成功，
+      # 它会通过 GITHUB_ENV 注入并覆盖此值）
+      DIGITALPLAT_HTTP_PROXY: ${{ vars.DIGITALPLAT_HTTP_PROXY }}
+    steps:
+      - name: Checkout (keepalive repo)
+        uses: actions/checkout@v4
+
+      # 业务代码在私有仓库：用细粒度 PAT（仅该私库、Contents:Read）拉取
+      - name: Checkout private code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: app
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install playwright
+          playwright install chromium --with-deps
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          # 真实 Chrome（比 bundled Chromium 指纹更真实，浏览器兜底通过率更高）
+          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y /tmp/chrome.deb || echo "Chrome 安装失败，回退 bundled Chromium"
+
+      # 可选：配置 HYSTERIA2_URI Secret 后，出站流量走该代理
+      #（数据中心 IP 会被 Cloudflare 直接 403 挑战，家宽/住宅出口才能稳定通过）
+      - name: Start hysteria2 proxy (optional)
+        if: env.HYSTERIA2_URI != ''
+        run: |
+          curl -fsSL -o hysteria https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64
+          chmod +x hysteria
+          # 把 hysteria2:// 分享链接解析成结构化客户端配置（JSON）
+          python3 - <<'PYEOF'
+          import json, os, urllib.parse
+          u = urllib.parse.urlparse(os.environ["HYSTERIA2_URI"].strip())
+          q = dict(urllib.parse.parse_qsl(u.query))
+          cfg = {
+              "server": f"{u.hostname}:{u.port or 443}",
+              "auth": urllib.parse.unquote(u.username or ""),
+              "socks5": {"listen": "127.0.0.1:1080"},
+              "http": {"listen": "127.0.0.1:8080"},
+          }
+          tls = {}
+          if q.get("sni"):
+              tls["sni"] = q["sni"]
+          if q.get("insecure") == "1":
+              tls["insecure"] = True
+          if q.get("pinSHA256"):
+              tls["pinSHA256"] = q["pinSHA256"]
+          if tls:
+              cfg["tls"] = tls
+          if q.get("obfs"):
+              cfg["obfs"] = {"type": q["obfs"],
+                             "obfs-password": q.get("obfs-password", "")}
+          with open("hy2.json", "w") as fh:
+              fh.write(json.dumps(cfg))
+          print("hysteria2 config written for", u.hostname)
+          PYEOF
+          nohup ./hysteria client -c hy2.json -l error > hysteria.log 2>&1 &
+          sleep 5
+          curl -fsS --max-time 20 -x http://127.0.0.1:8080 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc)=' \
+            || { echo "hysteria2 代理启动失败:"; tail -20 hysteria.log; exit 1; }
+          echo "DIGITALPLAT_HTTP_PROXY=http://127.0.0.1:8080" >> "$GITHUB_ENV"
+
+      - name: Run auto renew
+        working-directory: app
+        env:
+          # 凭据（账号模式；多账号用 DIGITALPLAT_ACCOUNTS，每行 邮箱:密码）
+          DIGITALPLAT_ACCOUNTS: ${{ secrets.DIGITALPLAT_ACCOUNTS }}
+          DIGITALPLAT_EMAIL: ${{ secrets.DIGITALPLAT_EMAIL }}
+          DIGITALPLAT_PASSWORD: ${{ secrets.DIGITALPLAT_PASSWORD }}
+          # CI 推荐：本地 tools/login_get_cookie.py 登录一次，把 cookies.txt
+          # 内容按账号顺序填到这里（每行一个），Actions 直接用会话续期
+          DIGITALPLAT_SESSIONS: ${{ secrets.DIGITALPLAT_SESSIONS }}
+          # 注意：此处不要定义 DIGITALPLAT_HTTP_PROXY —— 代理由 hysteria2 步骤
+          # 经 GITHUB_ENV 注入（步骤级 env 会覆盖它，导致代理失效）
+          DIGITALPLAT_RENEW_BEFORE_DAYS: ${{ vars.DIGITALPLAT_RENEW_BEFORE_DAYS }}
+          DIGITALPLAT_RENEWAL_TYPE: ${{ vars.DIGITALPLAT_RENEWAL_TYPE }}
+          DIGITALPLAT_RENEWAL_YEARS: ${{ vars.DIGITALPLAT_RENEWAL_YEARS }}
+          # 可选：Telegram 通知
+          DIGITALPLAT_BOT_TOKEN: ${{ secrets.DIGITALPLAT_BOT_TOKEN }}
+          DIGITALPLAT_CHAT_ID: ${{ secrets.DIGITALPLAT_CHAT_ID }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        # xvfb 虚拟显示：浏览器登录兜底需要"有头"环境才能通过 Turnstile
+        run: |
+          echo "出站代理: ${DIGITALPLAT_HTTP_PROXY:-未配置（将直连）}"
+          xvfb-run -a python digitalplat_auto_renew.py --state state/renew_state.json
+
+      # 防休眠：GitHub 会在仓库 60 天无活动后自动停用定时工作流。
+      # 每次运行都把时间戳提交到本公开仓库（只含时间戳，不含代码与凭据），
+      # 保证仓库每天至少一次 commit（即使本次无续期/运行失败）
+      - name: Keepalive (timestamp commit)
+        if: always()
+        run: |
+          date -u +"%Y-%m-%d %H:%M:%S UTC" > digitalplat/last_run.txt
+          git add digitalplat/last_run.txt
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: keepalive $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
